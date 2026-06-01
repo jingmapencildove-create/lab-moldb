@@ -326,7 +326,7 @@ tbody td{padding:9px 13px;font-size:13px;}
 // ═══════════════════════════════════════
 // 注意：此 API Key 为公开只读用途，生产环境建议使用后端代理
 const API_KEY = '$2a$10$GviOlwocy6z3vo9A4KgpYO5MgCUGM3g1H6hqpl24n2duzrztfF3nW';
-const BIN_URL = 'https://api.jsonbin.io/v3/bins';
+const BIN_URL = 'https://api.jsonbin.io/v3/b';    // JSONBin v3 API: /v3/b 而非 /v3/bins
 const DEFAULT_BIN_ID = '6a1d70c2ddf5aa59f77f7230';           // 后备 bin
 let BIN_ID = localStorage.getItem('moldb_bin_id') || DEFAULT_BIN_ID; // 从本地恢复，持久化 bin 映射
 const API_HEADERS = {
