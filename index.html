@@ -324,9 +324,11 @@ tbody td{padding:9px 13px;font-size:13px;}
 // ═══════════════════════════════════════
 // JSONBin 云端数据库配置
 // ═══════════════════════════════════════
+// 注意：此 API Key 为公开只读用途，生产环境建议使用后端代理
 const API_KEY = '$2a$10$GviOlwocy6z3vo9A4KgpYO5MgCUGM3g1H6hqpl24n2duzrztfF3nW';
 const BIN_URL = 'https://api.jsonbin.io/v3/bins';
-const BIN_ID = '6a1d70c2ddf5aa59f77f7230';
+const DEFAULT_BIN_ID = '6a1d70c2ddf5aa59f77f7230';           // 后备 bin
+let BIN_ID = localStorage.getItem('moldb_bin_id') || DEFAULT_BIN_ID; // 从本地恢复，持久化 bin 映射
 const API_HEADERS = {
   'Content-Type': 'application/json',
   'X-Master-Key': API_KEY,
@@ -356,6 +358,7 @@ let qState={}, editCtx=null;
 // ═══════════════════════════════════════
 async function loadData() {
   setSyncStatus('syncing');
+  document.getElementById('loading-msg').textContent = '正在从云端加载数据…';
   try {
     const res = await fetch(`${BIN_URL}/${BIN_ID}/latest`, {
       headers: API_HEADERS
@@ -363,16 +366,26 @@ async function loadData() {
     if (res.ok) {
       const json = await res.json();
       const d = json.record;
-      sampleData  = d.sampleData  || DEFAULT.sampleData;
-      bacteriaData= d.bacteriaData|| DEFAULT.bacteriaData;
-      usageData   = d.usageData   || DEFAULT.usageData;
+      sampleData   = d.sampleData   || JSON.parse(JSON.stringify(DEFAULT.sampleData));
+      bacteriaData = d.bacteriaData || JSON.parse(JSON.stringify(DEFAULT.bacteriaData));
+      usageData    = d.usageData    || [];
+      // 保存本地备份
+      saveLocal();
       setSyncStatus('ok');
       updateLastSync();
       renderAll();
       return;
     }
-    throw new Error('读取失败 ' + res.status);
+    // 404 = bin 不存在，尝试创建
+    if (res.status === 404) {
+      console.warn('云端 bin 不存在，尝试自动创建…');
+      await createBin();
+      return;
+    }
+    // 其他 HTTP 错误
+    throw new Error('读取失败 HTTP ' + res.status);
   } catch(e) {
+    console.error('loadData 失败:', e.message);
     setSyncStatus('error');
     showToast('云端加载失败，使用本地缓存','te');
     loadFromLocal();
@@ -383,6 +396,9 @@ async function createBin() {
   setSyncStatus('syncing');
   document.getElementById('loading-msg').textContent = '首次使用，正在初始化云端数据库…';
   try {
+    // 先从本地取数据，确保首次创建时也能上传已有的本地缓存
+    const local = localStorage.getItem('moldb_local');
+    const initialData = local ? JSON.parse(local) : DEFAULT;
     const res = await fetch(BIN_URL, {
       method: 'POST',
       headers: {
@@ -390,32 +406,47 @@ async function createBin() {
         'X-Bin-Name': 'lab-moldb',
         'X-Bin-Private': 'false',
       },
-      body: JSON.stringify(DEFAULT)
+      body: JSON.stringify(initialData)
     });
     if (res.ok) {
       const json = await res.json();
       BIN_ID = json.metadata.id;
-      localStorage.setItem('moldb_bin_id', BIN_ID);
-      sampleData   = DEFAULT.sampleData;
-      bacteriaData = DEFAULT.bacteriaData;
-      usageData    = DEFAULT.usageData;
+      localStorage.setItem('moldb_bin_id', BIN_ID);   // 持久化 bin id
+      sampleData   = initialData.sampleData   || JSON.parse(JSON.stringify(DEFAULT.sampleData));
+      bacteriaData = initialData.bacteriaData || JSON.parse(JSON.stringify(DEFAULT.bacteriaData));
+      usageData    = initialData.usageData    || [];
+      saveLocal();
       setSyncStatus('ok');
       updateLastSync();
+      showToast('云端数据库已初始化，数据同步已就绪','ts');
       renderAll();
     } else {
-      throw new Error('创建失败');
+      throw new Error('创建失败 HTTP ' + res.status);
     }
   } catch(e) {
+    console.error('createBin 失败:', e.message);
     setSyncStatus('error');
-    showToast('初始化失败，请刷新重试','te');
+    showToast('云端初始化失败，请检查网络后刷新重试','te');
     loadFromLocal();
   }
 }
 
+function saveLocal() {
+  try {
+    localStorage.setItem('moldb_local', JSON.stringify({sampleData,bacteriaData,usageData}));
+  } catch(e) { console.warn('本地存储空间不足，但仍会尝试云端保存'); }
+}
+
 async function saveData() {
+  // 始终先存本地备份（无论是否联网）
+  saveLocal();
+  // 离线时的处理：只存本地，不尝试云端
+  if (!navigator.onLine) {
+    setSyncStatus('error');
+    showToast('当前离线，已存本地缓存，联网后请刷新页面同步','te');
+    return;
+  }
   setSyncStatus('syncing');
-  // 同时存本地备份
-  localStorage.setItem('moldb_local', JSON.stringify({sampleData,bacteriaData,usageData}));
   try {
     const res = await fetch(`${BIN_URL}/${BIN_ID}`, {
       method: 'PUT',
@@ -425,12 +456,18 @@ async function saveData() {
     if (res.ok) {
       setSyncStatus('ok');
       updateLastSync();
+      console.log('已同步到云端:', new Date().toLocaleTimeString());
+    } else if (res.status === 404) {
+      // bin 丢失了（可能被手动删除），重新创建
+      console.warn('云端 bin 丢失，重新创建…');
+      await createBin();
     } else {
-      throw new Error('保存失败');
+      throw new Error('保存失败 HTTP ' + res.status);
     }
   } catch(e) {
+    console.error('saveData 失败:', e.message);
     setSyncStatus('error');
-    showToast('云端保存失败，已存本地备份','te');
+    showToast('云端保存失败，已存本地备份（下次联网会自动上传）','te');
   }
 }
 
@@ -439,32 +476,44 @@ function loadFromLocal() {
     const raw = localStorage.getItem('moldb_local');
     if (raw) {
       const d = JSON.parse(raw);
-      sampleData   = d.sampleData   || DEFAULT.sampleData;
-      bacteriaData = d.bacteriaData || DEFAULT.bacteriaData;
-      usageData    = d.usageData    || DEFAULT.usageData;
+      sampleData   = d.sampleData   || JSON.parse(JSON.stringify(DEFAULT.sampleData));
+      bacteriaData = d.bacteriaData || JSON.parse(JSON.stringify(DEFAULT.bacteriaData));
+      usageData    = d.usageData    || [];
     } else {
       sampleData   = JSON.parse(JSON.stringify(DEFAULT.sampleData));
       bacteriaData = JSON.parse(JSON.stringify(DEFAULT.bacteriaData));
       usageData    = [];
     }
-    renderAll();
   } catch(e) {
+    console.error('本地缓存损坏，使用空数据库');
     sampleData   = JSON.parse(JSON.stringify(DEFAULT.sampleData));
     bacteriaData = JSON.parse(JSON.stringify(DEFAULT.bacteriaData));
     usageData    = [];
-    renderAll();
   }
+  renderAll();
 }
 
 function setSyncStatus(state) {
   const el = document.getElementById('sync-status');
-  if (state==='syncing') el.innerHTML='<span class="sync-dot"></span>同步中…';
-  else if (state==='ok')  el.innerHTML='<span class="online-dot"></span>已同步';
-  else                    el.innerHTML='<span style="color:var(--red)">⚠ 同步失败</span>';
+  const sf = document.getElementById('sf-time');
+  if (state==='syncing') {
+    el.innerHTML='<span class="sync-dot"></span>同步中…';
+    if(sf)sf.textContent='--:--';
+  } else if (state==='ok') {
+    el.innerHTML='<span class="online-dot"></span>已同步';
+    const n=new Date(),p=x=>String(x).padStart(2,'0');
+    if(sf)sf.textContent=p(n.getHours())+':'+p(n.getMinutes());
+  } else {
+    el.innerHTML='<span style="color:var(--red)">⚠ 离线</span>';
+  }
 }
 function updateLastSync() {
   const n=new Date(),p=x=>String(x).padStart(2,'0');
-  document.getElementById('last-sync').textContent='上次同步：'+p(n.getHours())+':'+p(n.getMinutes())+':'+p(n.getSeconds());
+  const el = document.getElementById('last-sync');
+  if(el) el.textContent='上次同步：'+p(n.getHours())+':'+p(n.getMinutes())+':'+p(n.getSeconds());
+  // 同时更新侧边栏时间
+  const sf = document.getElementById('sf-time');
+  if(sf) sf.textContent=p(n.getHours())+':'+p(n.getMinutes());
 }
 
 // ═══════════════════════════════════════
@@ -874,7 +923,27 @@ function tick(){
   document.getElementById('sf-time').textContent=p(n.getHours())+':'+p(n.getMinutes());
 }
 
-// Init
+// ═══════════════════════════════════════
+// 在线/离线检测 & 自动重试同步
+// ═══════════════════════════════════════
+let syncRetryTimer = null;
+
+// 监听网络恢复 → 自动重试同步
+window.addEventListener('online', () => {
+  console.log('网络已恢复');
+  showToast('网络已恢复，重新连接云端…','ti');
+  loadData(); // 从云端拉取最新数据，覆盖本地
+});
+
+// 监听断网 → 提示用户
+window.addEventListener('offline', () => {
+  setSyncStatus('error');
+  showToast('网络已断开，修改将暂存本地','te');
+});
+
+// ═══════════════════════════════════════
+// 初始化
+// ═══════════════════════════════════════
 document.getElementById('us-date').value=TODAY;
 tick(); setInterval(tick,1000);
 renderQ(); renderPersonnel();
