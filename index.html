@@ -242,10 +242,18 @@ tbody td{padding:9px 13px;font-size:13px;}
     <div class="nav-item" onclick="goNav('personnel',this)" id="ni-personnel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>负责人</div>
   </div>
   <div class="sidebar-footer">
-    <span class="online-dot"></span>云端同步 &nbsp;·&nbsp; <span id="sf-time">--:--</span><br>
-    <span id="last-sync" style="font-size:10px;color:var(--text3)">上次同步：—</span>
+    <div><span class="online-dot"></span>云端同步 &nbsp;·&nbsp; <span id="sf-time">--:--</span></div>
+    <div id="last-sync" style="font-size:10px;color:var(--text3);margin-bottom:8px;">上次同步：—</div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;">
+      <button class="btn sm" onclick="downloadBackup()" title="下载完整数据库备份" style="font-size:10px;padding:3px 6px;">📥 备份</button>
+      <button class="btn sm" onclick="document.getElementById('restore-file-input').click()" title="从备份文件恢复" style="font-size:10px;padding:3px 6px;">📤 恢复</button>
+      <button class="btn sm" onclick="openGHModal()" title="配置 GitHub 自动备份" style="font-size:10px;padding:3px 6px;" id="btn-gh-config">🔧 GitHub</button>
+    </div>
+    <div id="gh-backup-status" style="font-size:10px;color:var(--text3);margin-top:4px;"></div>
   </div>
 </aside>
+<!-- 隐藏的文件选择器，用于恢复备份 -->
+<input type="file" id="restore-file-input" accept=".json" style="display:none" onchange="restoreFromFile(this.files[0]);this.value=''">
 
 <div class="main">
   <div class="topbar">
@@ -318,6 +326,23 @@ tbody td{padding:9px 13px;font-size:13px;}
 
 <div class="modal-bg" id="modal-edit"><div class="modal"><div class="mhd"><h3 id="edit-title">编辑记录</h3><button class="mc" onclick="closeModal('modal-edit')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div><div id="edit-fields"></div><div class="mft"><button class="btn" onclick="closeModal('modal-edit')">取消</button><button class="btn primary" onclick="saveEdit()">保存修改</button></div></div></div>
 
+<!-- GitHub 自动备份配置弹窗 -->
+<div class="modal-bg" id="modal-gh-backup"><div class="modal"><div class="mhd"><h3>GitHub 仓库自动备份</h3><button class="mc" onclick="closeModal('modal-gh-backup')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+  <div class="notice"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>每 30 分钟自动将完整数据库提交到仓库 <code>data.json</code> 文件，利用 Git 版本历史实现多版本冗余。</div>
+  <div class="fr"><label>GitHub Personal Access Token *</label><input type="password" id="gh-pat-input" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" style="width:100%"></div>
+  <div style="font-size:11px;color:var(--text3);margin-top:4px;">
+    Token 需要 <code>repo</code> 权限。获取方式：<br>
+    GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens (classic) → 勾选 <code>repo</code> → 生成 → 粘贴到此处。<br>
+    Token 仅保存在浏览器本地存储中，不会上传到第三方。
+  </div>
+  <div id="gh-status-detail" style="font-size:12px;margin-top:10px;color:var(--text2);"></div>
+  <div class="mft">
+    <button class="btn danger" onclick="disableGitHubBackup()">停用备份</button>
+    <button class="btn" onclick="closeModal('modal-gh-backup')">取消</button>
+    <button class="btn primary" onclick="enableGitHubBackup()">保存并启用</button>
+  </div>
+</div></div>
+
 <div class="toast" id="toast"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="toast-icon"></svg><span id="toast-msg"></span></div>
 
 <script>
@@ -374,6 +399,9 @@ async function loadData() {
       setSyncStatus('ok');
       updateLastSync();
       renderAll();
+      validateData();                     // ← 启动时校验数据完整性
+      updateGHBackupStatus();             // ← 刷新 GitHub 备份状态
+      startGitHubBackup();                // ← 如已配置则启动定时备份
       return;
     }
     // 404 = bin 不存在，尝试创建
@@ -420,6 +448,9 @@ async function createBin() {
       updateLastSync();
       showToast('云端数据库已初始化，数据同步已就绪','ts');
       renderAll();
+      validateData();
+      updateGHBackupStatus();
+      startGitHubBackup();
     } else {
       throw new Error('创建失败 HTTP ' + res.status);
     }
@@ -437,9 +468,308 @@ function saveLocal() {
   } catch(e) { console.warn('本地存储空间不足，但仍会尝试云端保存'); }
 }
 
+// ═══════════════════════════════════════
+// 冗余备份层：版本化快照 + GitHub 仓库备份
+// ═══════════════════════════════════════
+const MAX_SNAPSHOTS = 10;        // 最多保留 10 个版本
+const SNAPSHOT_KEY = 'moldb_snapshots';
+const GH_PAT_KEY = 'moldb_gh_pat';
+const GH_BACKUP_ENABLED_KEY = 'moldb_gh_backup_enabled';
+const GH_LAST_BACKUP_KEY = 'moldb_gh_last_backup';
+const GH_BACKUP_PATH = 'data.json';   // 仓库中的备份文件路径
+const GH_REPO = 'jingmapencildove-create/lab-moldb';
+const GH_BACKUP_INTERVAL = 30 * 60 * 1000; // GitHub 备份间隔：30分钟
+
+let ghBackupTimer = null;
+
+// 保存版本化快照到 localStorage（FIFO，保留最近 N 个）
+function backupLocalSnapshot() {
+  try {
+    const raw = localStorage.getItem(SNAPSHOT_KEY);
+    let snapshots = raw ? JSON.parse(raw) : [];
+    snapshots.push({
+      time: new Date().toISOString(),
+      totalRecords: Object.values(sampleData).reduce((s,arr)=>s+arr.length,0)
+                   + Object.values(bacteriaData).reduce((s,arr)=>s+arr.length,0)
+                   + usageData.length,
+      data: { sampleData, bacteriaData, usageData }
+    });
+    // 超过上限时移除最旧的
+    while (snapshots.length > MAX_SNAPSHOTS) snapshots.shift();
+    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(snapshots));
+    console.log(`本地快照已保存（${snapshots.length}/${MAX_SNAPSHOTS}）`);
+  } catch(e) {
+    console.warn('快照保存失败（可能存储空间不足）:', e.message);
+  }
+}
+
+// 获取所有快照列表（用于 UI 展示）
+function getSnapshots() {
+  try {
+    return JSON.parse(localStorage.getItem(SNAPSHOT_KEY) || '[]');
+  } catch(e) { return []; }
+}
+
+// 从指定快照恢复数据
+function restoreFromSnapshot(index) {
+  const snapshots = getSnapshots();
+  if (index < 0 || index >= snapshots.length) return false;
+  const d = snapshots[index].data;
+  sampleData   = d.sampleData   || JSON.parse(JSON.stringify(DEFAULT.sampleData));
+  bacteriaData = d.bacteriaData || JSON.parse(JSON.stringify(DEFAULT.bacteriaData));
+  usageData    = d.usageData    || [];
+  saveLocal();
+  renderAll();
+  saveData(); // 恢复到云端
+  return true;
+}
+
+// 下载完整数据库为 JSON 文件
+function downloadBackup() {
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    version: '3.0',
+    sampleData,
+    bacteriaData,
+    usageData
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `lab-moldb-backup-${TODAY}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('数据库已导出为 JSON 文件','ts');
+}
+
+// 从 JSON 文件恢复数据库
+function restoreFromFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const payload = JSON.parse(e.target.result);
+      // 校验数据结构
+      if (!payload.sampleData || !payload.bacteriaData || !payload.usageData) {
+        throw new Error('数据格式不正确：缺少必需字段');
+      }
+      const libs = ['nano','full','pep','prot'];
+      for (const lib of libs) {
+        if (!Array.isArray(payload.sampleData[lib]) || !Array.isArray(payload.bacteriaData[lib])) {
+          throw new Error(`库 ${lib} 数据格式损坏`);
+        }
+      }
+      if (!Array.isArray(payload.usageData)) throw new Error('领用记录格式损坏');
+      // 确认恢复
+      if (!confirm(
+        `确认从备份文件恢复？\n\n` +
+        `备份时间：${payload.exportedAt || '未知'}\n` +
+        `纳米抗体：${payload.sampleData.nano.length}样本 / ${payload.bacteriaData.nano.length}菌液\n` +
+        `全长抗体：${payload.sampleData.full.length}样本 / ${payload.bacteriaData.full.length}菌液\n` +
+        `多肽库：${payload.sampleData.pep.length}样本 / ${payload.bacteriaData.pep.length}菌液\n` +
+        `重组蛋白：${payload.sampleData.prot.length}样本 / ${payload.bacteriaData.prot.length}菌液\n` +
+        `领用记录：${payload.usageData.length}条\n\n` +
+        `⚠ 当前数据将被覆盖！`
+      )) return;
+      sampleData   = payload.sampleData;
+      bacteriaData = payload.bacteriaData;
+      usageData    = payload.usageData;
+      saveLocal();
+      backupLocalSnapshot();
+      renderAll();
+      saveData(); // 同步到云端
+      showToast('数据库已从备份恢复，并同步到云端','ts');
+    } catch(err) {
+      showToast('恢复失败：' + err.message,'te');
+      console.error(err);
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ═══════════════════════════════════════
+// GitHub 仓库自动备份
+// ═══════════════════════════════════════
+function isGitHubBackupEnabled() {
+  return localStorage.getItem(GH_BACKUP_ENABLED_KEY) === 'true'
+      && !!localStorage.getItem(GH_PAT_KEY);
+}
+
+function setGitHubPAT(token) {
+  if (!token) {
+    localStorage.removeItem(GH_PAT_KEY);
+    localStorage.removeItem(GH_BACKUP_ENABLED_KEY);
+    stopGitHubBackup();
+    return;
+  }
+  localStorage.setItem(GH_PAT_KEY, token);
+  localStorage.setItem(GH_BACKUP_ENABLED_KEY, 'true');
+  startGitHubBackup();
+}
+
+function getGitHubPAT() {
+  return localStorage.getItem(GH_PAT_KEY) || '';
+}
+
+async function commitToGitHub() {
+  if (!isGitHubBackupEnabled()) return;
+  const pat = getGitHubPAT();
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    sampleData, bacteriaData, usageData
+  };
+  const content = btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 2))));
+
+  try {
+    // 1) 先获取当前文件的 SHA（如果存在）
+    let sha = null;
+    const getRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${GH_BACKUP_PATH}`, {
+      headers: {
+        'Authorization': `token ${pat}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+    if (getRes.ok) {
+      const getJson = await getRes.json();
+      sha = getJson.sha;
+    } else if (getRes.status !== 404) {
+      console.warn('GitHub 备份：获取文件信息失败 HTTP', getRes.status);
+      return;
+    }
+
+    // 2) PUT 更新或创建
+    const body = {
+      message: `auto-backup: ${new Date().toLocaleString('zh-CN')}`,
+      content: content,
+      branch: 'main'
+    };
+    if (sha) body.sha = sha;
+
+    const putRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${GH_BACKUP_PATH}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `token ${pat}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (putRes.ok) {
+      localStorage.setItem(GH_LAST_BACKUP_KEY, new Date().toISOString());
+      console.log('GitHub 备份成功:', new Date().toLocaleTimeString());
+    } else {
+      const errJson = await putRes.json().catch(()=>({}));
+      console.warn('GitHub 备份失败 HTTP', putRes.status, errJson.message || '');
+      if (putRes.status === 401) {
+        stopGitHubBackup();
+        localStorage.setItem(GH_BACKUP_ENABLED_KEY, 'false');
+        showToast('GitHub Token 已失效，请重新设置','te');
+      }
+    }
+  } catch(e) {
+    console.warn('GitHub 备份网络错误:', e.message);
+  }
+}
+
+function startGitHubBackup() {
+  stopGitHubBackup();
+  if (!isGitHubBackupEnabled()) return;
+  // 首次启动后 1 分钟做第一次备份，之后每 30 分钟
+  ghBackupTimer = setTimeout(() => {
+    commitToGitHub();
+    ghBackupTimer = setInterval(commitToGitHub, GH_BACKUP_INTERVAL);
+  }, 60000);
+  console.log('GitHub 自动备份已启动（每30分钟）');
+}
+
+function stopGitHubBackup() {
+  if (ghBackupTimer) { clearTimeout(ghBackupTimer); clearInterval(ghBackupTimer); ghBackupTimer = null; }
+}
+
+// 验证数据完整性（在 loadData 后调用）
+function validateData() {
+  const libs = ['nano','full','pep','prot'];
+  let issues = [];
+  for (const lib of libs) {
+    if (!Array.isArray(sampleData[lib]))   issues.push(`${lib}样本库数据异常`);
+    if (!Array.isArray(bacteriaData[lib])) issues.push(`${lib}菌液库数据异常`);
+    // 检查样本必填字段
+    sampleData[lib].forEach((r,i) => {
+      if (!r.id) issues.push(`${lib}样本 #${i} 缺少编号`);
+      if (!r.coord) issues.push(`${lib}样本 ${r.id} 缺少坐标`);
+      if (r.initQty === undefined || r.initQty === null) issues.push(`${lib}样本 ${r.id} 缺少入库量`);
+    });
+    // 检查菌液必填字段
+    bacteriaData[lib].forEach((r,i) => {
+      if (!r.id) issues.push(`${lib}菌液 #${i} 缺少编号`);
+      if (!r.molecule) issues.push(`${lib}菌液 ${r.id} 缺少对应分子`);
+      if (!r.coord) issues.push(`${lib}菌液 ${r.id} 缺少坐标`);
+    });
+  }
+  if (!Array.isArray(usageData)) issues.push('领用记录数据异常');
+  if (issues.length > 0) {
+    console.warn('数据完整性检查发现问题：', issues);
+    showToast(`数据完整性：${issues.length}项异常，建议修复或恢复备份`,'te');
+  }
+  return issues.length === 0;
+}
+
+// ═══════════════════════════════════════
+// GitHub 备份弹窗控制
+// ═══════════════════════════════════════
+function updateGHBackupStatus() {
+  const el = document.getElementById('gh-backup-status');
+  const btn = document.getElementById('btn-gh-config');
+  const detailEl = document.getElementById('gh-status-detail');
+  if (!el) return;
+  const enabled = isGitHubBackupEnabled();
+  const lastBackup = localStorage.getItem(GH_LAST_BACKUP_KEY);
+  if (enabled) {
+    if (btn) btn.textContent = '✅ GitHub';
+    el.textContent = lastBackup ? `上次仓库备份：${new Date(lastBackup).toLocaleTimeString('zh-CN')}` : '仓库备份待执行…';
+    el.style.color = 'var(--green)';
+    if (detailEl) detailEl.innerHTML = '<span style="color:var(--green)">✅ 自动备份已启用（每30分钟）</span>';
+  } else {
+    if (btn) btn.textContent = '🔧 GitHub';
+    el.textContent = '仓库备份：未配置';
+    el.style.color = 'var(--text3)';
+    if (detailEl) detailEl.innerHTML = '⚠ 未配置自动备份，建议设置以增加冗余保护';
+  }
+}
+
+function enableGitHubBackup() {
+  const pat = document.getElementById('gh-pat-input').value.trim();
+  if (!pat) { showToast('请输入 GitHub Token','te'); return; }
+  if (!pat.startsWith('ghp_') && !pat.startsWith('github_pat_')) {
+    if (!confirm('Token 格式不像是 GitHub Personal Access Token，确认继续？')) return;
+  }
+  setGitHubPAT(pat);
+  closeModal('modal-gh-backup');
+  updateGHBackupStatus();
+  showToast('GitHub 自动备份已启用！首次备份将在1分钟后执行','ts');
+}
+
+function disableGitHubBackup() {
+  if (!confirm('确认停用 GitHub 自动备份？仓库中的数据备份文件不会被删除。')) return;
+  setGitHubPAT('');
+  closeModal('modal-gh-backup');
+  updateGHBackupStatus();
+  showToast('GitHub 自动备份已停用','ti');
+}
+
+// 打开 GitHub 备份弹窗时预填状态
+function openGHModal() {
+  const patInput = document.getElementById('gh-pat-input');
+  if (patInput) patInput.value = getGitHubPAT();
+  updateGHBackupStatus();
+  openModal('modal-gh-backup');
+}
+
 async function saveData() {
   // 始终先存本地备份（无论是否联网）
   saveLocal();
+  backupLocalSnapshot();                    // ← 冗余：每次保存生成版本快照
   // 离线时的处理：只存本地，不尝试云端
   if (!navigator.onLine) {
     setSyncStatus('error');
@@ -491,6 +821,9 @@ function loadFromLocal() {
     usageData    = [];
   }
   renderAll();
+  validateData();
+  updateGHBackupStatus();
+  startGitHubBackup();
 }
 
 function setSyncStatus(state) {
